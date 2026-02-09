@@ -10,12 +10,13 @@ import multiprocessing
 import queue
 import urllib.request
 import zipfile
+import gc
 from PIL import Image
 
 # ------------------------------------------------------------------
 # CONFIGURATION (Must be first Streamlit command)
 # ------------------------------------------------------------------
-st.set_page_config(page_title="Ultra-Fast OCR", layout="wide")
+st.set_page_config(page_title="OCR App (Low Memory)", layout="wide")
 
 # ------------------------------------------------------------------
 # 1. SETUP & DEPENDENCIES
@@ -150,8 +151,9 @@ def check_system_deps():
 def process_pdf_chunk(args):
     """
     Worker function to process a specific range of pages.
+    Includes memory optimization (DPI reduction, GC).
     """
-    pdf_path, start_page, end_page, tess_cmd, poppler_path, batch_id, queue_obj = args
+    pdf_path, start_page, end_page, tess_cmd, poppler_path, batch_id, queue_obj, dpi_val = args
     
     if tess_cmd:
         pytesseract.pytesseract.tesseract_cmd = tess_cmd
@@ -164,31 +166,45 @@ def process_pdf_chunk(args):
         # Notify UI: Start
         if queue_obj:
             queue_obj.put(('START', batch_id, f"{prefix}: Starting..."))
-            # Notify: Converting
-            queue_obj.put(('STATUS', batch_id, f"{prefix}: 🖼️ Converting to Images..."))
+            queue_obj.put(('STATUS', batch_id, f"{prefix}: 🖼️ Converting..."))
 
+        # MEMORY OPTIMIZATION: 
+        # 1. Use lower DPI (150 is usually sufficient for OCR, 300 is heavy)
+        # 2. Use grayscale=True (Reduces memory by ~66% vs RGB)
         images = convert_from_path(
             pdf_path, 
             first_page=start_page, 
             last_page=end_page, 
             poppler_path=poppler_path,
-            thread_count=1 
+            thread_count=1,
+            dpi=dpi_val,
+            grayscale=True 
         )
         
         total = len(images)
         
-        # Notify: OCR Starting (Move bar slightly to show conversion is done)
         if queue_obj:
             queue_obj.put(('STATUS', batch_id, f"{prefix}: 📖 Running OCR..."))
-            queue_obj.put(('PROGRESS', batch_id, 0, total)) # Reset to 0 relative to OCR steps
+            queue_obj.put(('PROGRESS', batch_id, 0, total))
 
-        for i, img in enumerate(images):
-            text = pytesseract.image_to_string(img, lang='eng')
+        # Iterate by index so we can explicitly clear memory
+        for i in range(total):
+            # Process one image
+            text = pytesseract.image_to_string(images[i], lang='eng')
             results.append((start_page + i, text))
             
-            # Notify UI: Progress
+            # MEMORY OPTIMIZATION: Aggressive cleanup
+            # Clear image data immediately after use
+            images[i].close()
+            images[i] = None
+            
+            # Notify UI
             if queue_obj:
                 queue_obj.put(('PROGRESS', batch_id, i + 1, total))
+        
+        # Force Garbage Collection inside worker
+        del images
+        gc.collect()
         
         # Notify UI: Done
         if queue_obj:
@@ -197,9 +213,8 @@ def process_pdf_chunk(args):
         return (True, results)
     except Exception as e:
         if queue_obj:
-            # Send error as status before dying
             queue_obj.put(('STATUS', batch_id, f"Error: {str(e)[:20]}..."))
-            time.sleep(1) # Give UI time to see it
+            time.sleep(1)
             queue_obj.put(('DONE', batch_id))
         return (False, str(e))
 
@@ -208,14 +223,34 @@ def process_pdf_chunk(args):
 # ------------------------------------------------------------------
 
 def main():
-    st.title("Ultra-Fast Multiprocess OCR")
+    st.title("Low-Memory OCR Converter")
     
     # Check dependencies on load
     if not check_system_deps():
         st.stop()
     
-    cpu_count = multiprocessing.cpu_count()
-    st.sidebar.info(f"Detected {cpu_count} CPU Cores")
+    # --- PERFORMANCE SETTINGS SIDEBAR ---
+    st.sidebar.header("⚙️ Performance Settings")
+    
+    # Detect CPU
+    detected_cpus = multiprocessing.cpu_count()
+    
+    # MEMORY FIX: Default to 2 workers max for stability on Cloud tiers
+    default_workers = min(detected_cpus, 2)
+    
+    num_workers = st.sidebar.slider(
+        "Worker Processes", 
+        min_value=1, 
+        max_value=detected_cpus, 
+        value=default_workers,
+        help="Higher = Faster but uses more RAM. Lower (1-2) = Safer for large files."
+    )
+    
+    # DPI Selection
+    use_high_res = st.sidebar.checkbox("High Resolution (Slower, More RAM)", value=False)
+    ocr_dpi = 300 if use_high_res else 150
+    
+    st.sidebar.info(f"Using {num_workers} Worker(s) @ {ocr_dpi} DPI")
     
     # --- RESULT HANDLING ---
     if "ocr_result" not in st.session_state:
@@ -223,7 +258,6 @@ def main():
         st.session_state.result_filename = "ocr_output.txt"
 
     # --- IMMEDIATE DOWNLOAD BUTTON ---
-    # We display this AT THE TOP if results exist
     if st.session_state.ocr_result:
         st.success("✅ Processing Complete! Download your file below:")
         st.download_button(
@@ -239,15 +273,13 @@ def main():
     uploaded_file = st.file_uploader("Upload PDF or Image", type=['pdf', 'png', 'jpg', 'jpeg', 'tiff'])
     
     if uploaded_file:
-        # Reset result if a new file is uploaded
         if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
             st.session_state.ocr_result = None
             st.session_state.current_file = uploaded_file.name
 
         # --- PROCESS BUTTON ---
-        if st.button(f"Start Processing (Uses {cpu_count} Cores)"):
+        if st.button(f"Start Processing"):
             
-            # Save uploaded file to temp path
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp:
                 tmp.write(uploaded_file.getvalue())
                 input_path = tmp.name
@@ -257,7 +289,6 @@ def main():
             progress_container = st.container()
             status_container = st.empty()
             
-            # Dictionary to track dynamic progress bars
             progress_bars = {}
             status_labels = {}
             
@@ -271,10 +302,11 @@ def main():
                     info = pdfinfo_from_path(input_path, poppler_path=poppler_path)
                     total_pages = info["Pages"]
                     
-                    status_container.info(f"PDF has {total_pages} pages. Distributing tasks...")
+                    status_container.info(f"PDF has {total_pages} pages. Splitting into batches...")
                     
                     # 2. Prepare Tasks
-                    chunk_size = 5
+                    # MEMORY FIX: Smaller chunks (3 pages) reduces peak RAM per worker
+                    chunk_size = 3
                     tasks = []
                     batch_counter = 0
                     
@@ -286,10 +318,12 @@ def main():
                     for start in range(1, total_pages + 1, chunk_size):
                         end = min(start + chunk_size - 1, total_pages)
                         batch_counter += 1
-                        tasks.append((input_path, start, end, tess_cmd, poppler_path, batch_counter, m_queue))
+                        # Pass dpi_val to worker
+                        tasks.append((input_path, start, end, tess_cmd, poppler_path, batch_counter, m_queue, ocr_dpi))
                     
                     # 3. Execute & Monitor
-                    pool = multiprocessing.Pool(processes=cpu_count)
+                    # MEMORY FIX: Use user-defined 'num_workers' instead of 'cpu_count'
+                    pool = multiprocessing.Pool(processes=num_workers)
                     async_results = []
                     
                     for task in tasks:
@@ -306,7 +340,6 @@ def main():
 
                     while active_tasks > 0:
                         try:
-                            # Process up to 20 messages at a time to prevent UI lag
                             for _ in range(20):
                                 msg = m_queue.get_nowait()
                                 type_, batch_id = msg[0], msg[1]
@@ -327,7 +360,6 @@ def main():
                                 elif type_ == 'PROGRESS':
                                     curr, total = msg[2], msg[3]
                                     if batch_id in progress_bars:
-                                        # Clamp between 0.0 and 1.0
                                         val = min(max(curr / total, 0.0), 1.0)
                                         progress_bars[batch_id].progress(val)
                                         
@@ -341,11 +373,10 @@ def main():
                         except queue.Empty:
                             pass
                         
-                        # Break loop if all workers finished
                         if all(r.ready() for r in async_results) and m_queue.empty():
                             break
                         
-                        time.sleep(0.05) # Slightly faster polling
+                        time.sleep(0.05)
 
                     pool.join()
                     
@@ -362,11 +393,10 @@ def main():
                     final_text = "\n".join([f"--- Page {p} ---\n{t}" for p, t in extracted_data])
 
                 else:
-                    # Image
                     with Image.open(input_path) as img:
                         final_text = pytesseract.image_to_string(img)
 
-                # Store result in session state
+                # Store result
                 st.session_state.ocr_result = final_text
                 st.session_state.result_filename = f"{os.path.splitext(uploaded_file.name)[0]}_ocr.txt"
                 
@@ -378,7 +408,6 @@ def main():
                 if os.path.exists(input_path):
                     os.unlink(input_path)
             
-            # Force rerun to show the download button immediately at the top
             st.rerun()
 
 if __name__ == "__main__":
