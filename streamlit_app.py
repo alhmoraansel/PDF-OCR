@@ -15,11 +15,10 @@ from PIL import Image
 # ------------------------------------------------------------------
 # CONFIGURATION (Must be first Streamlit command)
 # ------------------------------------------------------------------
-# MOVED HERE: This must run before any st.warning or st.error calls
 st.set_page_config(page_title="Ultra-Fast OCR", layout="wide")
 
 # ------------------------------------------------------------------
-# 1. SETUP & DEPENDENCIES (Ported from original)
+# 1. SETUP & DEPENDENCIES
 # ------------------------------------------------------------------
 
 def install_python_deps():
@@ -87,15 +86,37 @@ def get_tesseract_cmd():
     return None
 
 def check_system_deps():
-    """Checks and configures system dependencies."""
+    """Checks and configures system dependencies with auto-install on Linux."""
     system_os = platform.system()
     
     # 1. Tesseract
     tess_cmd = get_tesseract_cmd()
+    
+    # Auto-Install Logic for Linux
+    if not tess_cmd and system_os == "Linux":
+        st.info("Tesseract not found. Starting automatic installation (this may take a minute)...")
+        try:
+            # Determine if sudo is available/needed
+            cmd_prefix = ["sudo"] if shutil.which("sudo") else []
+            
+            st.write("Step 1/2: Updating package lists...")
+            subprocess.check_call(cmd_prefix + ["apt-get", "update"])
+            
+            st.write("Step 2/2: Installing Tesseract & Poppler...")
+            # Install both tesseract and poppler-utils in one go
+            subprocess.check_call(cmd_prefix + ["apt-get", "install", "-y", "tesseract-ocr", "poppler-utils"])
+            
+            st.success("Installation complete! Reloading app...")
+            time.sleep(1)
+            st.rerun()
+            return False # Stop execution here, rerun will restart
+        except Exception as e:
+            st.error(f"Automatic installation failed. Error: {e}")
+            st.error("Please ensure you have permission to install packages or add 'tesseract-ocr' and 'poppler-utils' to your packages.txt.")
+            return False
+
     if not tess_cmd:
-        if system_os == "Linux":
-            st.error("Tesseract not found. Run: `sudo apt-get install tesseract-ocr`")
-        elif system_os == "Darwin":
+        if system_os == "Darwin":
             st.error("Tesseract not found. Run: `brew install tesseract`")
         elif system_os == "Windows":
              st.warning("Tesseract not found. Attempting Winget install...")
@@ -118,14 +139,28 @@ def check_system_deps():
         if poppler_path and poppler_path not in os.environ["PATH"]:
             os.environ["PATH"] += os.pathsep + poppler_path
     
+    # On Linux, we handled poppler install above with tesseract.
+    # Just check if it exists now.
     if not shutil.which("pdfinfo") and not poppler_path:
-        st.error("Poppler (pdfinfo) not found. PDF processing will fail.")
-        return False
+        if system_os == "Linux":
+             # Fallback if tesseract was found but poppler wasn't
+             st.info("Poppler (pdfinfo) missing. Installing...")
+             try:
+                cmd_prefix = ["sudo"] if shutil.which("sudo") else []
+                subprocess.check_call(cmd_prefix + ["apt-get", "update"])
+                subprocess.check_call(cmd_prefix + ["apt-get", "install", "-y", "poppler-utils"])
+                st.rerun()
+             except Exception as e:
+                 st.error(f"Failed to install poppler: {e}")
+                 return False
+        else:
+            st.error("Poppler (pdfinfo) not found. PDF processing will fail.")
+            return False
 
     return True
 
 # ------------------------------------------------------------------
-# 2. WORKER LOGIC (Must be at module level for multiprocessing)
+# 2. WORKER LOGIC
 # ------------------------------------------------------------------
 
 def process_pdf_chunk(args):
@@ -176,8 +211,6 @@ def process_pdf_chunk(args):
 # ------------------------------------------------------------------
 
 def main():
-    # st.set_page_config is now called at the top of the file
-    
     st.title("Ultra-Fast Multiprocess OCR")
     
     # Check dependencies on load
@@ -189,21 +222,34 @@ def main():
     
     uploaded_file = st.file_uploader("Upload PDF or Image", type=['pdf', 'png', 'jpg', 'jpeg', 'tiff'])
     
-    if uploaded_file:
-        # Save uploaded file to temp path because pdf2image needs a real path
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp:
-            tmp.write(uploaded_file.getvalue())
-            input_path = tmp.name
+    # --- RESULT HANDLING ---
+    # We use session state to keep the download button available after re-runs
+    if "ocr_result" not in st.session_state:
+        st.session_state.ocr_result = None
+        st.session_state.result_filename = "ocr_output.txt"
 
+    if uploaded_file:
+        # Reset result if a new file is uploaded
+        # We use a unique key based on filename to detect change
+        file_key = f"processed_{uploaded_file.name}"
+        if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
+            st.session_state.ocr_result = None
+            st.session_state.current_file = uploaded_file.name
+
+        # --- PROCESS BUTTON ---
         if st.button(f"Start Processing (Uses {cpu_count} Cores)"):
             
+            # Save uploaded file to temp path because pdf2image needs a real path
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp:
+                tmp.write(uploaded_file.getvalue())
+                input_path = tmp.name
+
             # --- PROCESSING LOGIC ---
             st.write("### Processing Status")
-            log_container = st.empty()
             progress_container = st.container()
+            status_container = st.empty()
             
             # Dictionary to track dynamic progress bars
-            # Key: batch_id, Value: st.progress object
             progress_bars = {}
             status_labels = {}
             
@@ -217,14 +263,13 @@ def main():
                     info = pdfinfo_from_path(input_path, poppler_path=poppler_path)
                     total_pages = info["Pages"]
                     
-                    log_container.info(f"PDF has {total_pages} pages. Distributing tasks...")
+                    status_container.info(f"PDF has {total_pages} pages. Distributing tasks...")
                     
                     # 2. Prepare Tasks
                     chunk_size = 5
                     tasks = []
                     batch_counter = 0
                     
-                    # Use a Manager Queue for cross-process communication
                     manager = multiprocessing.Manager()
                     m_queue = manager.Queue()
                     
@@ -236,7 +281,6 @@ def main():
                         tasks.append((input_path, start, end, tess_cmd, poppler_path, batch_counter, m_queue))
                     
                     # 3. Execute & Monitor
-                    # We use apply_async so we can poll the queue in the main thread
                     pool = multiprocessing.Pool(processes=cpu_count)
                     async_results = []
                     
@@ -244,20 +288,16 @@ def main():
                         res = pool.apply_async(process_pdf_chunk, (task,))
                         async_results.append(res)
                     
-                    pool.close() # No more tasks will be added
+                    pool.close() 
                     
                     # Polling Loop
                     active_tasks = len(tasks)
                     
-                    # Container for dynamic bars
                     with progress_container:
-                        # We create a grid or list of placeholders
-                        # Since we don't know exact order, we create placeholders dynamically
-                        pass
+                        pass # Anchor
 
                     while active_tasks > 0:
                         try:
-                            # Drain queue
                             while True:
                                 msg = m_queue.get_nowait()
                                 type_, batch_id = msg[0], msg[1]
@@ -265,7 +305,6 @@ def main():
                                 if type_ == 'START':
                                     label_txt = msg[2]
                                     with progress_container:
-                                        # Create new UI elements for this batch
                                         col1, col2 = st.columns([1, 3])
                                         status_labels[batch_id] = col1.empty()
                                         status_labels[batch_id].text(label_txt)
@@ -277,8 +316,6 @@ def main():
                                         progress_bars[batch_id].progress(curr / total)
                                         
                                 elif type_ == 'DONE':
-                                    # In Streamlit, we can't easily "destroy" widgets, 
-                                    # but we can empty them.
                                     if batch_id in progress_bars:
                                         progress_bars[batch_id].empty()
                                         status_labels[batch_id].empty()
@@ -288,7 +325,6 @@ def main():
                         except queue.Empty:
                             pass
                         
-                        # Check if processes are actually done
                         if all(r.ready() for r in async_results):
                             break
                         
@@ -313,17 +349,35 @@ def main():
                     with Image.open(input_path) as img:
                         final_text = pytesseract.image_to_string(img)
 
-                st.success("Processing Complete!")
-                st.download_button("Download Extracted Text", final_text, file_name="ocr_output.txt")
+                # Store result in session state
+                st.session_state.ocr_result = final_text
+                st.session_state.result_filename = f"{os.path.splitext(uploaded_file.name)[0]}_ocr.txt"
+                
+                status_container.success("Processing Complete!")
                 
             except Exception as e:
                 st.error(f"An error occurred: {e}")
             finally:
-                # Cleanup temp file
                 if os.path.exists(input_path):
                     os.unlink(input_path)
+            
+            # Force rerun to show the download button immediately at the top/bottom
+            st.rerun()
+
+    # --- DOWNLOAD SECTION ---
+    # Display this outside the 'if uploaded_file' block or after it, 
+    # checking session state so it persists.
+    if st.session_state.ocr_result:
+        st.markdown("---")
+        st.success("✅ File Ready for Download")
+        st.download_button(
+            label="Download Extracted Text", 
+            data=st.session_state.ocr_result, 
+            file_name=st.session_state.result_filename,
+            mime="text/plain",
+            type="primary" # Make it prominent
+        )
 
 if __name__ == "__main__":
-    # Required for Windows multiprocessing
     multiprocessing.freeze_support()
     main()
