@@ -86,59 +86,35 @@ def get_tesseract_cmd():
     return None
 
 def check_system_deps():
-    """Checks and configures system dependencies with auto-install on Linux."""
+    """Checks system dependencies."""
     system_os = platform.system()
-    
-    # 1. Tesseract
     tess_cmd = get_tesseract_cmd()
     
-    # Auto-Install Logic for Linux
-    if not tess_cmd and system_os == "Linux":
-        st.info("Tesseract not found. Starting automatic installation...")
-        
-        # Method 1: Try with Sudo
-        try:
-            if shutil.which("sudo"):
-                st.write("Attempting install with sudo...")
-                subprocess.check_call(["sudo", "apt-get", "update"])
-                subprocess.check_call(["sudo", "apt-get", "install", "-y", "tesseract-ocr", "poppler-utils"])
-                st.success("Installation complete! Reloading...")
-                time.sleep(1)
-                st.rerun()
-                return False
-        except Exception as e_sudo:
-            st.warning(f"Sudo installation failed: {e_sudo}")
-
-        # Method 2: Try without Sudo (if running as root)
-        try:
-            st.write("Attempting install without sudo...")
-            subprocess.check_call(["apt-get", "update"])
-            subprocess.check_call(["apt-get", "install", "-y", "tesseract-ocr", "poppler-utils"])
-            st.success("Installation complete! Reloading...")
-            time.sleep(1)
-            st.rerun()
-            return False
-        except Exception as e_root:
-            st.error(f"Direct installation failed: {e_root}")
-            
-        # If both fail, give up and point to packages.txt
-        st.error("❌ Critical: Could not install system dependencies.")
-        st.markdown("""
-        **If you are on Streamlit Cloud:**
-        1. Ensure the file `packages.txt` exists in your repository.
-        2. It must contain:
-           ```text
-           tesseract-ocr
-           poppler-utils
-           ```
-        3. Reboot the app on the dashboard.
-        """)
-        st.stop()
-        return False
-
+    # 1. Tesseract Check
     if not tess_cmd:
-        if system_os == "Darwin":
+        if system_os == "Linux":
+            # On Streamlit Cloud/Linux, we CANNOT use sudo/apt-get from python.
+            # We must rely on packages.txt.
+            st.error("❌ System Dependency Missing: Tesseract-OCR")
+            st.markdown("""
+            **Deployment Error:**
+            The app cannot find `tesseract`. 
+            
+            1. Ensure `packages.txt` exists in your repo.
+            2. It must contain exactly:
+               ```
+               tesseract-ocr
+               poppler-utils
+               libgl1
+               ```
+            3. Reboot the app in Streamlit Cloud dashboard.
+            """)
+            st.stop()
+            return False
+            
+        elif system_os == "Darwin":
             st.error("Tesseract not found. Run: `brew install tesseract`")
+            return False
         elif system_os == "Windows":
              st.warning("Tesseract not found. Attempting Winget install...")
              try:
@@ -146,11 +122,11 @@ def check_system_deps():
                  st.success("Tesseract installed. Please restart the app.")
              except:
                  st.error("Automatic install failed. Please install Tesseract-OCR manually.")
-        return False
+             return False
     else:
         pytesseract.pytesseract.tesseract_cmd = tess_cmd
 
-    # 2. Poppler
+    # 2. Poppler Check
     poppler_path = None
     if system_os == "Windows":
         poppler_path = get_poppler_path_windows()
@@ -160,23 +136,12 @@ def check_system_deps():
         if poppler_path and poppler_path not in os.environ["PATH"]:
             os.environ["PATH"] += os.pathsep + poppler_path
     
-    # On Linux, we handled poppler install above with tesseract.
-    # Just check if it exists now.
     if not shutil.which("pdfinfo") and not poppler_path:
+        st.error("❌ System Dependency Missing: Poppler (pdfinfo)")
         if system_os == "Linux":
-             # Fallback if tesseract was found but poppler wasn't
-             st.info("Poppler (pdfinfo) missing. Installing...")
-             try:
-                cmd_prefix = ["sudo"] if shutil.which("sudo") else []
-                subprocess.check_call(cmd_prefix + ["apt-get", "update"])
-                subprocess.check_call(cmd_prefix + ["apt-get", "install", "-y", "poppler-utils"])
-                st.rerun()
-             except Exception as e:
-                 st.error(f"Failed to install poppler: {e}")
-                 return False
-        else:
-            st.error("Poppler (pdfinfo) not found. PDF processing will fail.")
-            return False
+            st.markdown("Ensure `poppler-utils` is listed in your `packages.txt` file.")
+        st.stop()
+        return False
 
     return True
 
@@ -264,8 +229,6 @@ def main():
     
     if uploaded_file:
         # Reset result if a new file is uploaded
-        # We use a unique key based on filename to detect change
-        file_key = f"processed_{uploaded_file.name}"
         if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
             st.session_state.ocr_result = None
             st.session_state.current_file = uploaded_file.name
@@ -283,7 +246,6 @@ def main():
             progress_container = st.container()
             status_container = st.empty()
             
-            # Dictionary to track dynamic progress bars
             progress_bars = {}
             status_labels = {}
             
