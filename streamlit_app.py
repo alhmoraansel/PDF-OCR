@@ -1,4 +1,4 @@
-import streamlit_app as st
+import streamlit as st
 import sys
 import os
 import subprocess
@@ -11,6 +11,12 @@ import queue
 import urllib.request
 import zipfile
 from PIL import Image
+
+# ------------------------------------------------------------------
+# CONFIGURATION (Must be first Streamlit command)
+# ------------------------------------------------------------------
+# MOVED HERE: This must run before any st.warning or st.error calls
+st.set_page_config(page_title="Ultra-Fast OCR", layout="wide")
 
 # ------------------------------------------------------------------
 # 1. SETUP & DEPENDENCIES (Ported from original)
@@ -170,7 +176,7 @@ def process_pdf_chunk(args):
 # ------------------------------------------------------------------
 
 def main():
-    st.set_page_config(page_title="Ultra-Fast OCR", layout="wide")
+    # st.set_page_config is now called at the top of the file
     
     st.title("Ultra-Fast Multiprocess OCR")
     
