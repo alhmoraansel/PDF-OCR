@@ -94,26 +94,47 @@ def check_system_deps():
     
     # Auto-Install Logic for Linux
     if not tess_cmd and system_os == "Linux":
-        st.info("Tesseract not found. Starting automatic installation (this may take a minute)...")
+        st.info("Tesseract not found. Starting automatic installation...")
+        
+        # Method 1: Try with Sudo
         try:
-            # Determine if sudo is available/needed
-            cmd_prefix = ["sudo"] if shutil.which("sudo") else []
-            
-            st.write("Step 1/2: Updating package lists...")
-            subprocess.check_call(cmd_prefix + ["apt-get", "update"])
-            
-            st.write("Step 2/2: Installing Tesseract & Poppler...")
-            # Install both tesseract and poppler-utils in one go
-            subprocess.check_call(cmd_prefix + ["apt-get", "install", "-y", "tesseract-ocr", "poppler-utils"])
-            
-            st.success("Installation complete! Reloading app...")
+            if shutil.which("sudo"):
+                st.write("Attempting install with sudo...")
+                subprocess.check_call(["sudo", "apt-get", "update"])
+                subprocess.check_call(["sudo", "apt-get", "install", "-y", "tesseract-ocr", "poppler-utils"])
+                st.success("Installation complete! Reloading...")
+                time.sleep(1)
+                st.rerun()
+                return False
+        except Exception as e_sudo:
+            st.warning(f"Sudo installation failed: {e_sudo}")
+
+        # Method 2: Try without Sudo (if running as root)
+        try:
+            st.write("Attempting install without sudo...")
+            subprocess.check_call(["apt-get", "update"])
+            subprocess.check_call(["apt-get", "install", "-y", "tesseract-ocr", "poppler-utils"])
+            st.success("Installation complete! Reloading...")
             time.sleep(1)
             st.rerun()
-            return False # Stop execution here, rerun will restart
-        except Exception as e:
-            st.error(f"Automatic installation failed. Error: {e}")
-            st.error("Please ensure you have permission to install packages or add 'tesseract-ocr' and 'poppler-utils' to your packages.txt.")
             return False
+        except Exception as e_root:
+            st.error(f"Direct installation failed: {e_root}")
+            
+        # If both fail, give up and point to packages.txt
+        st.error("❌ Critical: Could not install system dependencies.")
+        st.markdown("""
+        **If you are on Streamlit Cloud:**
+        1. Ensure the file `packages.txt` exists in your repository.
+        2. It must contain:
+           ```text
+           tesseract-ocr
+           poppler-utils
+           ```
+        3. Reboot the app on the dashboard.
+        """)
+        st.stop()
+        return False
 
     if not tess_cmd:
         if system_os == "Darwin":
@@ -220,14 +241,27 @@ def main():
     cpu_count = multiprocessing.cpu_count()
     st.sidebar.info(f"Detected {cpu_count} CPU Cores")
     
-    uploaded_file = st.file_uploader("Upload PDF or Image", type=['pdf', 'png', 'jpg', 'jpeg', 'tiff'])
-    
     # --- RESULT HANDLING ---
-    # We use session state to keep the download button available after re-runs
     if "ocr_result" not in st.session_state:
         st.session_state.ocr_result = None
         st.session_state.result_filename = "ocr_output.txt"
 
+    # --- IMMEDIATE DOWNLOAD BUTTON ---
+    # We display this AT THE TOP if results exist
+    if st.session_state.ocr_result:
+        st.success("✅ Processing Complete! Download your file below:")
+        st.download_button(
+            label="⬇️ Download Extracted Text", 
+            data=st.session_state.ocr_result, 
+            file_name=st.session_state.result_filename,
+            mime="text/plain",
+            type="primary",
+            key="download_top"
+        )
+        st.markdown("---")
+
+    uploaded_file = st.file_uploader("Upload PDF or Image", type=['pdf', 'png', 'jpg', 'jpeg', 'tiff'])
+    
     if uploaded_file:
         # Reset result if a new file is uploaded
         # We use a unique key based on filename to detect change
@@ -361,22 +395,8 @@ def main():
                 if os.path.exists(input_path):
                     os.unlink(input_path)
             
-            # Force rerun to show the download button immediately at the top/bottom
+            # Force rerun to show the download button immediately at the top
             st.rerun()
-
-    # --- DOWNLOAD SECTION ---
-    # Display this outside the 'if uploaded_file' block or after it, 
-    # checking session state so it persists.
-    if st.session_state.ocr_result:
-        st.markdown("---")
-        st.success("✅ File Ready for Download")
-        st.download_button(
-            label="Download Extracted Text", 
-            data=st.session_state.ocr_result, 
-            file_name=st.session_state.result_filename,
-            mime="text/plain",
-            type="primary" # Make it prominent
-        )
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
