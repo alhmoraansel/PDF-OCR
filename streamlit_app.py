@@ -93,8 +93,6 @@ def check_system_deps():
     # 1. Tesseract Check
     if not tess_cmd:
         if system_os == "Linux":
-            # On Streamlit Cloud/Linux, we CANNOT use sudo/apt-get from python.
-            # We must rely on packages.txt.
             st.error("❌ System Dependency Missing: Tesseract-OCR")
             st.markdown("""
             **Deployment Error:**
@@ -161,9 +159,13 @@ def process_pdf_chunk(args):
     results = [] 
     
     try:
+        prefix = f"Pages {start_page}-{end_page}"
+        
         # Notify UI: Start
         if queue_obj:
-            queue_obj.put(('START', batch_id, f"Pages {start_page}-{end_page}"))
+            queue_obj.put(('START', batch_id, f"{prefix}: Starting..."))
+            # Notify: Converting
+            queue_obj.put(('STATUS', batch_id, f"{prefix}: 🖼️ Converting to Images..."))
 
         images = convert_from_path(
             pdf_path, 
@@ -174,6 +176,12 @@ def process_pdf_chunk(args):
         )
         
         total = len(images)
+        
+        # Notify: OCR Starting (Move bar slightly to show conversion is done)
+        if queue_obj:
+            queue_obj.put(('STATUS', batch_id, f"{prefix}: 📖 Running OCR..."))
+            queue_obj.put(('PROGRESS', batch_id, 0, total)) # Reset to 0 relative to OCR steps
+
         for i, img in enumerate(images):
             text = pytesseract.image_to_string(img, lang='eng')
             results.append((start_page + i, text))
@@ -189,6 +197,9 @@ def process_pdf_chunk(args):
         return (True, results)
     except Exception as e:
         if queue_obj:
+            # Send error as status before dying
+            queue_obj.put(('STATUS', batch_id, f"Error: {str(e)[:20]}..."))
+            time.sleep(1) # Give UI time to see it
             queue_obj.put(('DONE', batch_id))
         return (False, str(e))
 
@@ -236,7 +247,7 @@ def main():
         # --- PROCESS BUTTON ---
         if st.button(f"Start Processing (Uses {cpu_count} Cores)"):
             
-            # Save uploaded file to temp path because pdf2image needs a real path
+            # Save uploaded file to temp path
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp:
                 tmp.write(uploaded_file.getvalue())
                 input_path = tmp.name
@@ -246,6 +257,7 @@ def main():
             progress_container = st.container()
             status_container = st.empty()
             
+            # Dictionary to track dynamic progress bars
             progress_bars = {}
             status_labels = {}
             
@@ -294,22 +306,30 @@ def main():
 
                     while active_tasks > 0:
                         try:
-                            while True:
+                            # Process up to 20 messages at a time to prevent UI lag
+                            for _ in range(20):
                                 msg = m_queue.get_nowait()
                                 type_, batch_id = msg[0], msg[1]
                                 
                                 if type_ == 'START':
                                     label_txt = msg[2]
                                     with progress_container:
-                                        col1, col2 = st.columns([1, 3])
+                                        col1, col2 = st.columns([1, 2])
                                         status_labels[batch_id] = col1.empty()
                                         status_labels[batch_id].text(label_txt)
                                         progress_bars[batch_id] = col2.progress(0)
-                                        
+                                
+                                elif type_ == 'STATUS':
+                                    label_txt = msg[2]
+                                    if batch_id in status_labels:
+                                        status_labels[batch_id].text(label_txt)
+
                                 elif type_ == 'PROGRESS':
                                     curr, total = msg[2], msg[3]
                                     if batch_id in progress_bars:
-                                        progress_bars[batch_id].progress(curr / total)
+                                        # Clamp between 0.0 and 1.0
+                                        val = min(max(curr / total, 0.0), 1.0)
+                                        progress_bars[batch_id].progress(val)
                                         
                                 elif type_ == 'DONE':
                                     if batch_id in progress_bars:
@@ -321,10 +341,11 @@ def main():
                         except queue.Empty:
                             pass
                         
-                        if all(r.ready() for r in async_results):
+                        # Break loop if all workers finished
+                        if all(r.ready() for r in async_results) and m_queue.empty():
                             break
                         
-                        time.sleep(0.1)
+                        time.sleep(0.05) # Slightly faster polling
 
                     pool.join()
                     
